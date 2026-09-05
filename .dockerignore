@@ -4,26 +4,27 @@
 
 .circleci*
 docs*
-vendor*
 tests*
 tests/dump*
-.circleci*
-docs*
 
 .vscode*
 .idea*
 venv*
-go*
+__pycache__*
+*.pyc
 dump*
 
-README.md
-README.md.bu
-NOTES.md
+# Dev / legacy files not needed in the image (the Go source and the Python
+# analysis files are intentionally NOT ignored).
 LICENSE
 Makefile
+README*
 CHANGELOG.md
-docker-compose.ci.yml
+NOTES.md
 Dockerfile.dev
+docker-compose.ci.yml
 Pipfile
-Pipefile.lock
-pecheck*
+Pipfile.lock
+requirements.txt
+hooks*
+config.toml

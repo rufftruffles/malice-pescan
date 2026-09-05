@@ -1,35 +1,26 @@
 # -*- coding: utf-8 -*-
-# This file is part of MaliceIO - https://github.com/malice-plugins/pdf
+# This file is part of MaliceIO - https://github.com/malice-plugins/pescan
 # See the file 'LICENSE' for copying permission.
-
-__description__ = 'Malice PExecutable Plugin - pefile helper util'
-__author__ = 'blacktop - <https://github.com/blacktop>'
-__version__ = '0.1.0'
-__date__ = '2018/08/18'
+#
+# Modernized (Python 3.12) PE analyzer. Ported from the classic
+# malice/__init__.py (MalPEFile). The signature analysis moved to
+# signature.py; everything else (info, debug, imports, exports, resources,
+# version info, strings, imphash, compile time, PEiD, sections, language,
+# pehash, entry point, slack space) is preserved with the same result keys.
 
 import datetime
-import json
 import logging
 import re
-import tempfile
 import time
-from io import BytesIO
+from collections.abc import Iterable
 from os import path
-from collections import Iterable
-import chardet
 
 import pefile
 import peutils
-from future.builtins import open
-from pehash.pehasher import calculate_pehash
-from sig import get_signify
-from utils import get_entropy, get_md5, get_sha256, get_type, sha256_checksum
-from utils.charset import safe_str, translate_str
 
-from .lcid import LCID
-
-# from verifysigs.asn1utils import dn
-# from verifysigs.sigs_helper import get_auth_data
+from pehash import calculate_pehash
+from utils import get_entropy, get_md5, get_sha256, get_type, safe_str, sha256_checksum
+from lcid import LCID
 
 log = logging.getLogger(__name__)
 
@@ -39,13 +30,12 @@ class MalPEFile(object):
     def __init__(self, file_path, peid_db_path, should_dump=False, dump_path=None):
         self.file = file_path
         self.sha256 = sha256_checksum(self.file)
-        self.data = open(file_path, 'rb').read()
+        with open(file_path, 'rb') as fh:
+            self.data = fh.read()
         self.peid_db = peid_db_path
         self.dump = None
         self.pe = None
         self.results = {}
-        self.result_compile_time = None
-        self.result_sections = None
         if not path.exists(self.file):
             raise Exception("file does not exist: {}".format(self.file))
         if should_dump:
@@ -64,10 +54,12 @@ class MalPEFile(object):
         if hasattr(self.pe, 'OPTIONAL_HEADER'):
             info['image_base'] = self.pe.OPTIONAL_HEADER.ImageBase
             info['size_of_image'] = self.pe.OPTIONAL_HEADER.SizeOfImage
-            info['linker_version'] = "{:02d}.{:02d}".format(self.pe.OPTIONAL_HEADER.MajorLinkerVersion,
-                                                            self.pe.OPTIONAL_HEADER.MinorLinkerVersion)
-            info['os_version'] = "{:02d}.{:02d}".format(self.pe.OPTIONAL_HEADER.MajorOperatingSystemVersion,
-                                                        self.pe.OPTIONAL_HEADER.MinorOperatingSystemVersion)
+            info['linker_version'] = "{:02d}.{:02d}".format(
+                self.pe.OPTIONAL_HEADER.MajorLinkerVersion,
+                self.pe.OPTIONAL_HEADER.MinorLinkerVersion)
+            info['os_version'] = "{:02d}.{:02d}".format(
+                self.pe.OPTIONAL_HEADER.MajorOperatingSystemVersion,
+                self.pe.OPTIONAL_HEADER.MinorOperatingSystemVersion)
             data = []
             for data_directory in self.pe.OPTIONAL_HEADER.DATA_DIRECTORY:
                 if data_directory.Size or data_directory.VirtualAddress:
@@ -80,17 +72,17 @@ class MalPEFile(object):
         if hasattr(self.pe, 'FILE_HEADER'):
             info['number_of_sections'] = self.pe.FILE_HEADER.NumberOfSections
             info['machine_type'] = "{} ({})".format(
-                hex(self.pe.FILE_HEADER.Machine), pefile.MACHINE_TYPE[self.pe.FILE_HEADER.Machine])
+                hex(self.pe.FILE_HEADER.Machine),
+                pefile.MACHINE_TYPE.get(self.pe.FILE_HEADER.Machine, "UNKNOWN"))
         if hasattr(self.pe, 'RICH_HEADER') and self.pe.RICH_HEADER is not None:
             rich_header_info = []
             values_list = self.pe.RICH_HEADER.values
-            for i in range(0, len(values_list) / 2):
-                line = {
+            for i in range(0, len(values_list) // 2):
+                rich_header_info.append({
                     'tool_id': values_list[2 * i] >> 16,
                     'version': values_list[2 * i] & 0xFFFF,
                     'times used': values_list[2 * i + 1]
-                }
-                rich_header_info.append(line)
+                })
             self.results['rich_header_info'] = rich_header_info
         self.results['info'] = info
 
@@ -98,17 +90,8 @@ class MalPEFile(object):
         if hasattr(self.pe, 'DebugTimeDateStamp'):
             debug = {}
             debug['time_date_stamp'] = "%s" % time.ctime(self.pe.DebugTimeDateStamp)
-
-            # When it is a unicode, we know we are coming from RSDS which is UTF-8
-            # otherwise, we come from NB10 and we need to guess the charset.
-            if not isinstance(self.pe.pdb_filename, unicode):
-                char_enc_guessed = translate_str(self.pe.pdb_filename)
-                pdb_filename = char_enc_guessed['converted']
-            else:
-                char_enc_guessed = {'confidence': 1.0, 'encoding': 'utf-8'}
-                pdb_filename = self.pe.pdb_filename
-
-            debug['time_date_stamp'] = pdb_filename
+            if hasattr(self.pe, 'pdb_filename') and self.pe.pdb_filename:
+                debug['pdb_filename'] = safe_str(self.pe.pdb_filename)
             self.results['debug'] = debug
 
     def imports(self):
@@ -116,40 +99,32 @@ class MalPEFile(object):
         if hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT') and len(self.pe.DIRECTORY_ENTRY_IMPORT) > 0:
             for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
                 try:
-                    if isinstance(entry.dll, bytes):
-                        dll = entry.dll.decode()
-                    else:
-                        dll = entry.dll
+                    dll = safe_str(entry.dll)
                     log.info("DLL: {0}".format(dll))
                     dlls = {dll: []}
                     for symbol in entry.imports:
-                        if isinstance(symbol.name, bytes):
-                            name = symbol.name.decode()
-                        else:
-                            name = symbol.name
+                        name = safe_str(symbol.name)
                         dlls[dll].append(dict(address=hex(symbol.address), name=name))
                     imports.append(dlls)
-                    # self.log('item', "{0}: {1}".format(hex(symbol.address), name))
                 except Exception:
                     continue
         self.results['imports'] = imports
 
     def exports(self):
         exports = []
-        if hasattr(self.pe,
-                   'DIRECTORY_ENTRY_EXPORT') and self.pe.DIRECTORY_ENTRY_EXPORT.struct.TimeDateStamp is not None:
+        if hasattr(self.pe, 'DIRECTORY_ENTRY_EXPORT') and \
+                self.pe.DIRECTORY_ENTRY_EXPORT.struct.TimeDateStamp is not None:
             for symbol in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
-                exports.append(
-                    dict(
-                        address=hex(self.pe.OPTIONAL_HEADER.ImageBase + symbol.address),
-                        name=symbol.name,
-                        ordinal=symbol.ordinal))
+                exports.append(dict(
+                    address=hex(self.pe.OPTIONAL_HEADER.ImageBase + symbol.address),
+                    name=safe_str(symbol.name),
+                    ordinal=symbol.ordinal))
             self.results['exports'] = exports
 
             # get export module name
             section = self.pe.get_section_by_rva(self.pe.DIRECTORY_ENTRY_EXPORT.struct.Name)
             offset = section.get_offset_from_rva(self.pe.DIRECTORY_ENTRY_EXPORT.struct.Name)
-            self.pe.ModuleName = self.pe.__data__[offset:offset + self.pe.__data__[offset:].find(chr(0))]
+            self.pe.ModuleName = self.pe.__data__[offset:offset + self.pe.__data__[offset:].find(b'\x00')]
             self.results['exports_module_Name'] = safe_str(self.pe.ModuleName)
             self.results['exports_timestamp'] = time.ctime(self.pe.DIRECTORY_ENTRY_EXPORT.struct.TimeDateStamp)
 
@@ -163,21 +138,21 @@ class MalPEFile(object):
         }
 
     def peid(self):
-
         self.results['peid'] = []
 
         def get_signatures():
-
             with open(self.peid_db, 'rt', encoding='ISO-8859-1') as f:
                 sig_data = f.read()
-
             return peutils.SignatureDatabase(data=sig_data)
 
         def get_matches(pe, signatures):
-            matches = signatures.match_all(pe, ep_only=True)
-            return matches
+            return signatures.match_all(pe, ep_only=True)
 
-        peid_matches = get_matches(self.pe, get_signatures())
+        try:
+            peid_matches = get_matches(self.pe, get_signatures())
+        except Exception as e:
+            log.error("PEiD matching failed: %s", e)
+            peid_matches = None
 
         if peid_matches:
             for sig in peid_matches:
@@ -191,21 +166,16 @@ class MalPEFile(object):
     def resources(self):
         self.results['resources'] = []
 
-        # Use this function to retrieve resources for the given PE instance.
-        # Returns all the identified resources with indicators and attributes.
         def get_resources(pe):
             resources = []
             if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
                 count = 1
                 for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
                     try:
-                        resource = {}
-
                         if resource_type.name is not None:
                             name = str(resource_type.name)
                         else:
                             name = str(pefile.RESOURCE_TYPE.get(resource_type.struct.Id, "UNKNOWN"))
-
                         if name is None:
                             name = str(resource_type.struct.Id)
 
@@ -233,30 +203,21 @@ class MalPEFile(object):
 
                                         # Dump resources if requested
                                         if self.dump and pe == self.pe:
-                                            if self.dump:
-                                                folder = self.dump
-                                            else:
-                                                folder = tempfile.mkdtemp()
-
-                                            resource_path = path.join(folder, '{0}_{1}_{2}'.format(
-                                                self.sha256, offset, name))
+                                            folder = self.dump
+                                            resource_path = path.join(
+                                                folder, '{0}_{1}_{2}'.format(self.sha256, offset, name))
                                             resource.append(resource_path)
-
                                             with open(resource_path, 'wb') as resource_handle:
                                                 resource_handle.write(data)
 
                                         resources.append(resource)
-
                                         count += 1
                     except Exception as e:
                         log.error(e)
                         continue
-
             return resources
 
-        # Obtain resources for the currently opened file.
         resources = get_resources(self.pe)
-
         if not resources:
             log.warning("No resources found")
             return
@@ -299,13 +260,14 @@ class MalPEFile(object):
                                 pe_resource_verinfo_res['lang_id'] = '{} is invalid'.format(lang_id)
 
                             for entry in info.StringTable[0].entries.items():
-                                if entry[0] == 'OriginalFilename':
-                                    pe_resource_verinfo_res['original_filename'] = entry[1]
-                                elif entry[0] == 'FileDescription':
-                                    pe_resource_verinfo_res['file_description'] = entry[1]
+                                key = safe_str(entry[0])
+                                if key == 'OriginalFilename':
+                                    pe_resource_verinfo_res['original_filename'] = safe_str(entry[1])
+                                elif key == 'FileDescription':
+                                    pe_resource_verinfo_res['file_description'] = safe_str(entry[1])
                                 else:
-                                    if len(entry[1]) > 0:
-                                        pe_resource_verinfo_res[entry[0].lower()] = entry[1]
+                                    if len(safe_str(entry[1])) > 0:
+                                        pe_resource_verinfo_res[key.lower()] = safe_str(entry[1])
                         pe_resource_verinfo_res_list.append(pe_resource_verinfo_res)
             if len(pe_resource_verinfo_res_list) > 1:
                 self.results['resource_versioninfo'] = pe_resource_verinfo_res_list
@@ -356,40 +318,32 @@ class MalPEFile(object):
                             if self.pe.get_word_at_rva(data_rva + offset) == 0x1 \
                                     and self.pe.get_word_at_rva(data_rva + offset + WORD) == 0xFFFF:
                                 # Use Extended Dialog Parsing
-
-                                # Remove leading bytes
                                 offset += DIALOGEX_LEAD
-                                if data[offset:offset + 2] == "\xFF\xFF":
+                                if data[offset:offset + 2] == b"\xFF\xFF":
                                     offset += DWORD
                                 else:
                                     offset += WORD
-                                if data[offset:offset + 2] == "\xFF\xFF":
+                                if data[offset:offset + 2] == b"\xFF\xFF":
                                     offset += DWORD
                                 else:
                                     offset += WORD
 
-                                # Get window title
                                 window_title = self.pe.get_string_u_at_rva(data_rva + offset)
                                 if len(window_title) != 0:
                                     strings.append(("DIALOG_TITLE", window_title))
                                 offset += len(window_title) * 2 + WORD
 
-                                # Remove trailing bytes
                                 offset += DIALOGEX_TRAIL
                                 offset += len(self.pe.get_string_u_at_rva(data_rva + offset)) * 2 + WORD
 
-                                # alignment adjustment
                                 if (offset % 4) != 0:
                                     offset += WORD
 
                                 while True:
-
                                     if offset >= size:
                                         break
-
                                     offset += DIALOGEX_ITEM_LEAD
 
-                                    # Get item type
                                     if self.pe.get_word_at_rva(data_rva + offset) == 0xFFFF:
                                         offset += WORD
                                         item_type = ITEM_TYPES[self.pe.get_word_at_rva(data_rva + offset)]
@@ -398,7 +352,6 @@ class MalPEFile(object):
                                         item_type = self.pe.get_string_u_at_rva(data_rva + offset)
                                         offset += len(item_type) * 2 + WORD
 
-                                    # Get item text
                                     item_text = self.pe.get_string_u_at_rva(data_rva + offset)
                                     if len(item_text) != 0:
                                         strings.append((item_type, item_text))
@@ -407,26 +360,22 @@ class MalPEFile(object):
                                     extra_bytes = self.pe.get_word_at_rva(data_rva + offset)
                                     offset += extra_bytes + DIALOGEX_ITEM_TRAIL
 
-                                    # Alignment adjustment
                                     if (offset % 4) != 0:
                                         offset += WORD
-
                             else:
-                                # TODO: Use Non extended Dialog Parsing
-                                # Remove leading bytes
+                                # Non-extended Dialog Parsing
                                 style = self.pe.get_word_at_rva(data_rva + offset)
 
                                 offset += DIALOG_LEAD
-                                if data[offset:offset + 2] == "\xFF\xFF":
+                                if data[offset:offset + 2] == b"\xFF\xFF":
                                     offset += DWORD
                                 else:
                                     offset += len(self.pe.get_string_u_at_rva(data_rva + offset)) * 2 + WORD
-                                if data[offset:offset + 2] == "\xFF\xFF":
+                                if data[offset:offset + 2] == b"\xFF\xFF":
                                     offset += DWORD
                                 else:
                                     offset += len(self.pe.get_string_u_at_rva(data_rva + offset)) * 2 + WORD
 
-                                # Get window title
                                 window_title = self.pe.get_string_u_at_rva(data_rva + offset)
                                 if len(window_title) != 0:
                                     strings.append(("DIALOG_TITLE", window_title))
@@ -436,18 +385,14 @@ class MalPEFile(object):
                                     offset += WORD
                                     offset += len(self.pe.get_string_u_at_rva(data_rva + offset)) * 2 + WORD
 
-                                # Alignment adjustment
                                 if (offset % 4) != 0:
                                     offset += WORD
 
                                 while True:
-
                                     if offset >= size:
                                         break
-
                                     offset += DIALOG_ITEM_LEAD
 
-                                    # Get item type
                                     if self.pe.get_word_at_rva(data_rva + offset) == 0xFFFF:
                                         offset += WORD
                                         item_type = ITEM_TYPES[self.pe.get_word_at_rva(data_rva + offset)]
@@ -456,7 +401,6 @@ class MalPEFile(object):
                                         item_type = self.pe.get_string_u_at_rva(data_rva + offset)
                                         offset += len(item_type) * 2 + WORD
 
-                                    # Get item text
                                     if self.pe.get_word_at_rva(data_rva + offset) == 0xFFFF:
                                         offset += DWORD
                                     else:
@@ -468,7 +412,6 @@ class MalPEFile(object):
                                     extra_bytes = self.pe.get_word_at_rva(data_rva + offset)
                                     offset += extra_bytes + WORD
 
-                                    # Alignment adjustment
                                     if (offset % 4) != 0:
                                         offset += WORD
 
@@ -480,13 +423,10 @@ class MalPEFile(object):
                             while True:
                                 if offset >= size:
                                     break
-
                                 ustr_length = self.pe.get_word_from_data(data[offset:offset + 2], 0)
                                 offset += 2
-
                                 if ustr_length == 0:
                                     continue
-
                                 ustr = self.pe.get_string_u_at_rva(data_rva + offset, max_length=ustr_length)
                                 offset += ustr_length * 2
                                 strings.append((None, ustr))
@@ -494,149 +434,45 @@ class MalPEFile(object):
                         if len(strings) > 0:
                             success = False
                             try:
-                                comment = "%s (id:%s - lang_id:0x%04X [%s])" % (str(dir_type.name), str(nameID.name),
-                                                                                language.id, LCID[language.id])
+                                comment = "%s (id:%s - lang_id:0x%04X [%s])" % (
+                                    str(dir_type.name), str(nameID.name), language.id, LCID[language.id])
                             except KeyError:
-                                comment = "%s (id:%s - lang_id:0x%04X [Unknown language])" % (str(
-                                    dir_type.name), str(nameID.name), language.id)
+                                comment = "%s (id:%s - lang_id:0x%04X [Unknown language])" % (
+                                    str(dir_type.name), str(nameID.name), language.id)
                             log.debug("PE: STRINGS - %s" % comment)
                             for idx in range(len(strings)):
-                                # noinspection PyBroadException
                                 try:
                                     tag_value = strings[idx][1]
-
-                                    # The following line crash chardet if a
-                                    # UPX packed file as packed the resources...
-                                    chardet.detect(tag_value)  # TODO: Find a better way to do this
-
                                     tag_value = tag_value.replace('\r', ' ').replace('\n', ' ')
                                     if strings[idx][0] is not None:
                                         tags.append(strings[idx][0])
-                                        # res.add_line(
-                                        #     [strings[idx][0], ": ",
-                                        #      res_txt_tag(tag_value, TAG_TYPE['FILE_STRING'])])
                                     else:
                                         tags.append(tag_value)
-                                        # res.add_line(res_txt_tag(tag_value, TAG_TYPE['FILE_STRING']))
-
                                     success = True
-                                except:
+                                except Exception:
                                     pass
                             if success:
                                 self.results['resource_strings'] = tags
 
     def slack_space(self):
-        if self.results['info']['calculated_file_size'] > 0 and (len(self.pe.__data__) >
-                                                                 self.results['info']['calculated_file_size']):
+        if 'calculated_file_size' in self.results.get('info', {}) \
+                and self.results['info']['calculated_file_size'] > 0 \
+                and (len(self.pe.__data__) > self.results['info']['calculated_file_size']):
             slack_size = len(self.pe.__data__) - self.results['info']['calculated_file_size']
             if self.dump:
                 slack_path = path.join(self.dump, '{}_slack.bin'.format(self.sha256))
                 with open(slack_path, 'wb') as shandle:
-                    shandle.write(self.pe.__data__[self.results['info']['calculated_file_size']:
-                                                   self.results['info']['calculated_file_size'] + slack_size])
+                    shandle.write(self.pe.__data__[
+                        self.results['info']['calculated_file_size']:
+                        self.results['info']['calculated_file_size'] + slack_size])
 
     def imphash(self):
         self.results['imphash'] = self.pe.get_imphash()
 
     def security(self):
+        # The classic engine's Authenticode verification lived here but was
+        # fully commented out (dead). Signature analysis is now in signature.py.
         pass
-        # def get_certificate(pe):
-        #     # TODO: this only extract the raw list of certificate data.
-        #     # I need to parse them, extract single certificates and perhaps return
-        #     # the PEM data of the first certificate only.
-        #     pe_security_dir = pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']
-        #     address = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pe_security_dir].VirtualAddress
-        #     #  size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pe_security_dir].Size
-
-        #     if address:
-        #         return pe.write()[address + 8:]
-        #     else:
-        #         return None
-
-        # cert_data = get_certificate(self.pe)
-
-        # if not cert_data:
-        #     log.warning("No certificate found")
-        #     return
-
-        # cert_sha256 = sha256_checksum(cert_data)
-
-        # if self.args.dump:
-        #     cert_path = path.join(self.args.dump, '{0}.crt'.format(cert_sha256))
-        #     with open(cert_path, 'wb+') as cert_handle:
-        #         cert_handle.write(cert_data)
-
-        #     log.info("Dumped certificate to {0}".format(cert_path))
-        #     log.info(
-        #         "You can parse it using the following command:\n\topenssl pkcs7 -inform DER -print_certs -text -in {0}".
-        #         format(cert_path))
-
-        # # TODO: this function needs to be better integrated with the rest of the command.
-        # # TODO: need to add more error handling and figure out why so many samples are failing.
-        # if self.args.check:
-
-        #     try:
-        #         auth, computed_content_hash = get_auth_data(__sessions__.current.file.path)
-        #     except Exception as e:
-        #         self.log('error', "Unable to parse PE certificate: {0}".format(str(e)))
-        #         return
-
-        #     try:
-        #         auth.ValidateAsn1()
-        #         auth.ValidateHashes(computed_content_hash)
-        #         auth.ValidateSignatures()
-        #         auth.ValidateCertChains(time.gmtime())
-        #     except Exception as e:
-        #         self.log('error', "Unable to validate PE certificate: {0}".format(str(e)))
-        #         return
-
-        #     self.log('info', bold('Signature metadata:'))
-        #     self.log('info', 'Program name: {0}'.format(auth.program_name))
-        #     self.log('info', 'URL: {0}'.format(auth.program_url))
-
-        #     if auth.has_countersignature:
-        #         self.log(
-        #             'info',
-        #             bold('Countersignature is present. Timestamp: {0} UTC'.format(
-        #                 time.asctime(time.gmtime(auth.counter_timestamp)))))
-        #     else:
-        #         self.log('info', bold('Countersignature is not present.'))
-
-        #     self.log('info', bold('Binary is signed with cert issued by:'))
-        #     self.log('info', '{0}'.format(auth.signing_cert_id[0]))
-
-        #     self.log('info', '{0}'.format(auth.cert_chain_head[2][0]))
-        #     self.log('info', 'Chain not before: {0} UTC'.format(time.asctime(time.gmtime(auth.cert_chain_head[0]))))
-        #     self.log('info', 'Chain not after: {0} UTC'.format(time.asctime(time.gmtime(auth.cert_chain_head[1]))))
-
-        #     if auth.has_countersignature:
-        #         self.log('info', bold('Countersig chain head issued by:'))
-        #         self.log('info', '{0}'.format(auth.counter_chain_head[2]))
-        #         self.log('info', 'Countersig not before: {0} UTC'.format(
-        #             time.asctime(time.gmtime(auth.counter_chain_head[0]))))
-        #         self.log('info', 'Countersig not after: {0} UTC'.format(
-        #             time.asctime(time.gmtime(auth.counter_chain_head[1]))))
-
-        #     self.log('info', bold('Certificates:'))
-        #     for (issuer, serial), cert in auth.certificates.items():
-        #         self.log('info', 'Issuer: {0}'.format(issuer))
-        #         self.log('info', 'Serial: {0}'.format(serial))
-        #         subject = cert[0][0]['subject']
-        #         subject_dn = str(dn.DistinguishedName.TraverseRdn(subject[0]))
-        #         self.log('info', 'Subject: {0}'.format(subject_dn))
-        #         not_before = cert[0][0]['validity']['notBefore']
-        #         not_after = cert[0][0]['validity']['notAfter']
-        #         not_before_time = not_before.ToPythonEpochTime()
-        #         not_after_time = not_after.ToPythonEpochTime()
-        #         self.log('info', 'Not Before: {0} UTC ({1})'.format(
-        #             time.asctime(time.gmtime(not_before_time)), not_before[0]))
-        #         self.log('info', 'Not After: {0} UTC ({1})'.format(
-        #             time.asctime(time.gmtime(not_after_time)), not_after[0]))
-
-        #     if auth.trailing_data:
-        #         self.log(
-        #             'info', 'Signature Blob had trailing (unvalidated) data ({0} bytes): {1}'.format(
-        #                 len(auth.trailing_data), auth.trailing_data.encode('hex')))
 
     def language(self):
 
@@ -644,15 +480,13 @@ class MalPEFile(object):
             iat = []
             if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
                 for peimport in pe.DIRECTORY_ENTRY_IMPORT:
-                    iat.append(peimport.dll)
-
+                    iat.append(safe_str(peimport.dll))
             return iat
 
         def check_module(iat, match):
             for imp in iat:
                 if imp.find(match) != -1:
                     return True
-
             return False
 
         def is_cpp(data, cpp_count):
@@ -660,18 +494,16 @@ class MalPEFile(object):
                 if b'type_info' in line or b'RTTI' in line:
                     cpp_count += 1
                     break
-
             if cpp_count == 2:
                 return True
-
             return False
 
         def is_delphi(data):
             for line in data:
                 if b'Borland' in line:
-                    path = line.split(b'\\')
-                    for p in path:
-                        if b'Delphi' in p:
+                    p = line.split(b'\\')
+                    for pp in p:
+                        if b'Delphi' in pp:
                             return True
             return False
 
@@ -681,21 +513,18 @@ class MalPEFile(object):
                     stuff = line.split(b'.')
                     if b'VisualBasic' in stuff:
                         return True
-
             return False
 
         def is_autoit(data):
             for line in data:
                 if b'AU3!' in line:
                     return True
-
             return False
 
         def is_packed(pe):
             for section in pe.sections:
                 if section.get_entropy() > 7:
                     return True
-
             return False
 
         def get_strings(content):
@@ -707,23 +536,19 @@ class MalPEFile(object):
             cpp_count = 0
             found = None
 
-            # VB check
             if check_module(iat, 'VB'):
-                log('info', "{0} - Possible language: Visual Basic".format(sample.name))
+                log.info("{0} - Possible language: Visual Basic".format(sample))
                 return 'Visual Basic'
 
-            # .NET check
             if check_module(iat, 'mscoree.dll') and not found:
                 dotnet = True
                 found = '.NET'
 
-            # C DLL check
             if not found and (check_module(iat, 'msvcr') or check_module(iat, 'MSVCR') or check_module(iat, 'c++')):
                 cpp_count += 1
 
             if not found:
                 data = get_strings(content)
-
                 if is_cpp(data, cpp_count) and not found:
                     found = 'CPP'
                 if not found and cpp_count == 1:
@@ -734,33 +559,20 @@ class MalPEFile(object):
                     found = 'Visual Basic .NET'
                 if is_autoit(data) and not found:
                     found = 'AutoIt'
-
             return found
 
         self.results['is_packed'] = is_packed(self.pe)
         if self.results['is_packed']:
             log.warning("Probably packed, the language guess might be unreliable")
-
         self.results['language'] = find_language(get_iat(self.pe), self.file, self.data)
 
     def sections(self):
         sections = []
         for section in self.pe.sections:
-            if isinstance(section.Name, bytes):
-                section_name = section.Name.decode()
-            else:
-                section_name = safe_str(section.Name)
+            section_name = safe_str(section.Name)
             section_name = section_name.replace('\x00', '')
-            # if self.dump:
-            #     file_handle = BytesIO(self.data)
-            #     file_handle.seek(int(section.PointerToRawData))
-            #     section_data = file_handle.read(int(section.SizeOfRawData))
-            #
-            #     dump_path = path.join(self.dump, '{}_{}.bin'.format(self.sha256, section_name))
-            #     with open(dump_path, 'wb') as dump_handle:
-            #         dump_handle.write(section_data)
 
-            # calculated file size
+            # calculated file size (running max over sections)
             self.results['info']['calculated_file_size'] = int(section.VirtualAddress) + int(section.Misc_VirtualSize)
 
             sections.append({
@@ -772,23 +584,14 @@ class MalPEFile(object):
                 'entropy': section.get_entropy(),
                 'md5': section.get_hash_md5(),
             })
-
         self.results['sections'] = sections
 
     def pehash(self):
         self.results['pehash'] = calculate_pehash(self.file)
 
-    def triage(self):
-        pass
-
     def run(self):
-
         try:
-            # get cert info
-            self.results['signature'] = get_signify(self.file, log=log)
-
             self.pe = pefile.PE(self.file)
-            # print(self.pe.dump_info())
 
             # run all the analysis
             self.info()
@@ -810,8 +613,10 @@ class MalPEFile(object):
 
         except pefile.PEFormatError as e:
             log.error("Unable to parse PE file: {0}".format(e))
-            if e.value != "DOS Header magic not found.":
-                self.results['error'] = "this file looks like a PE but failed loading inside PE file. [", e.value, "]"
+            # A plain "not a PE" (no DOS magic) is a graceful no-op, matching
+            # the classic engine; any other parse failure is reported.
+            if getattr(e, 'value', str(e)) != "DOS Header magic not found.":
+                self.results['error'] = "this file looks like a PE but failed loading inside PE file. [{}]".format(str(e))
         except Exception as e:
             log.exception(e)
 

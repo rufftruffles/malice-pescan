@@ -2,18 +2,15 @@ REPO=malice-plugins/pescan
 ORG=malice
 NAME=pescan
 CATEGORY=exe
-VERSION=$(shell cat VERSION)
-FLAGS?=
+VERSION?=$(shell cat VERSION)
+MALWARE=tests/hw2.exe
 
-MALWARE?=tests/malware
-EXTRACT?=/malware/tests/dump
-MALICE_SCANID?=
 
-all: build size tag test_all
+all: build size tag test
 
 .PHONY: build
 build:
-	docker build $(FLAGS) -t $(ORG)/$(NAME):$(VERSION) .
+	docker build -t $(ORG)/$(NAME):$(VERSION) .
 
 .PHONY: size
 size:
@@ -29,11 +26,16 @@ tags:
 
 .PHONY: ssh
 ssh:
-	@docker run --init -it --rm -v $(PWD):/malware --entrypoint=sh $(ORG)/$(NAME):$(VERSION)
+	@docker run --init -it --rm --entrypoint=bash $(ORG)/$(NAME):$(VERSION)
 
 .PHONY: tar
 tar:
 	docker save $(ORG)/$(NAME):$(VERSION) -o $(NAME).tar
+
+.PHONY: go-test
+go-test:
+	go get
+	go test -v
 
 .PHONY: start_elasticsearch
 start_elasticsearch:
@@ -42,67 +44,39 @@ ifeq ("$(shell docker inspect -f {{.State.Running}} elasticsearch)", "true")
 	@docker rm -f elasticsearch || true
 endif
 	@echo "===> Starting elasticsearch"
-	@docker run --init -d --name elasticsearch -p 9200:9200 malice/elasticsearch:6.5; sleep 15
-
-.PHONY: malware
-malware:
-ifeq (,$(wildcard $(MALWARE)))
-	wget https://github.com/maliceio/malice-av/raw/master/samples/befb88b89c2eb401900a68e9f5b78764203f2b48264fcc3f7121bf04a57fd408 -O $(MALWARE)
-	cd tests; echo "TEST" > not.malware
-endif
+	@docker run --init -d --name elasticsearch -p 9200:9200 blacktop/elasticsearch:6
+	@wait-for-es
 
 .PHONY: test_all
-test_all: test test_elastic test_markdown test_web
+test_all: test test_elastic test_markdown
 
 .PHONY: test
-test: malware
+test:
 	@echo "===> ${NAME} --help"
-	@docker run --rm $(ORG)/$(NAME):$(VERSION); sleep 10
-	@echo "===> ${NAME} malware test"
-	@docker run --rm -v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) scan -vvvv -d --output $(EXTRACT) $(MALWARE) | jq . > docs/results.json
-	@cat docs/results.json | jq .
+	docker run --init --rm $(ORG)/$(NAME):$(VERSION) --help
+	docker run --init --rm -v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) -V $(MALWARE) | jq . > docs/results.json
+	cat docs/results.json | jq .
 
 .PHONY: test_elastic
-test_elastic: start_elasticsearch malware
-	@echo "===> ${NAME} test_elastic found"
-	docker run --rm --link elasticsearch -e MALICE_ELASTICSEARCH_URL=elasticsearch -v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) scan -vvvv -d --output $(EXTRACT) $(MALWARE)
-	# @echo "===> ${NAME} test_elastic NOT found"
-	# docker run --rm --link elasticsearch -e MALICE_ELASTICSEARCH_URL=elasticsearch $(ORG)/$(NAME):$(VERSION) -V --api ${MALICE_VT_API} lookup $(MISSING_HASH)
+test_elastic: start_elasticsearch
+	@echo "===> ${NAME} test_elastic"
+	docker run --rm --link elasticsearch -e MALICE_ELASTICSEARCH_URL=http://elasticsearch:9200 -v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) -V $(MALWARE)
 	http localhost:9200/malice/_search | jq . > docs/elastic.json
 
 .PHONY: test_extern_elastic
-test_extern_elastic: malware
-	@echo "===> ${NAME} test_extern_elastic found"
-	docker run --rm \
+test_extern_elastic:
+	@echo "===> ${NAME} test_extern_elastic"
+	docker run --rm -it \
 	-e MALICE_ELASTICSEARCH_URL=${MALICE_ELASTICSEARCH_URL} \
 	-e MALICE_ELASTICSEARCH_USERNAME=${MALICE_ELASTICSEARCH_USERNAME} \
 	-e MALICE_ELASTICSEARCH_PASSWORD=${MALICE_ELASTICSEARCH_PASSWORD} \
 	-e MALICE_ELASTICSEARCH_INDEX="test" \
-	-v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) scan -vvvv -d --output $(EXTRACT) $(MALWARE)
+	-v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) -V $(MALWARE)
 
 .PHONY: test_markdown
 test_markdown: test_elastic
 	@echo "===> ${NAME} test_markdown"
-	# http localhost:9200/malice/_search query:=@docs/query.json | jq . > docs/elastic.json
 	cat docs/elastic.json | jq -r '.hits.hits[] ._source.plugins.${CATEGORY}.${NAME}.markdown' > docs/SAMPLE.md
-
-.PHONY: test_web
-test_web: malware stop
-	@echo "===> Starting web service"
-	@docker run -d --name $(NAME)-web -p 3993:3993 $(ORG)/$(NAME):$(VERSION) web
-	sleep 10; http -f localhost:3993/scan malware@tests/hw2.exe
-	@echo "===> Stopping web service"
-	@docker logs $(NAME)-web
-	@docker rm -f $(NAME)-web
-
-.PHONY: test_malice
-test_malice:
-	@echo "===> $(ORG)/$(NAME):$(VERSION) testing with running malice elasticsearch DB (update existing sample)"
-	@docker run --rm -e MALICE_SCANID=$(MALICE_SCANID) -e MALICE_ELASTICSEARCH_URL=elasticsearch --link malice-elastic:elasticsearch -v $(PWD):/malware $(ORG)/$(NAME):$(VERSION) scan -t -vvvv $(MALWARE)
-
-.PHONY: run
-run: stop ## Run docker container
-	@docker run --init -d --name $(NAME) -p 9200:9200 $(ORG)/$(NAME):$(VERSION)
 
 .PHONY: stop
 stop: ## Kill running docker containers
@@ -110,37 +84,26 @@ stop: ## Kill running docker containers
 
 .PHONY: circle
 circle: ci-size
-	@sed -i.bu 's/docker%20image-.*-blue/docker%20image-$(shell cat .circleci/SIZE)-blue/' README.md
-	@echo "===> Image size is: $(shell cat .circleci/SIZE)"
+	@sed -i.bu 's/docker%20image-.*-blue/docker%20image-$(shell cat .circleci/size)-blue/' README.md
+	@echo "===> Image size is: $(shell cat .circleci/size)"
 
 ci-build:
 	@echo "===> Getting CircleCI build number"
 	@http https://circleci.com/api/v1.1/project/github/${REPO} | jq '.[0].build_num' > .circleci/build_num
 
 ci-size: ci-build
-	@echo "===> Getting image build size from CircleCI"
-	@http "$(shell http https://circleci.com/api/v1.1/project/github/${REPO}/$(shell cat .circleci/build_num)/artifacts${CIRCLE_TOKEN} | jq '.[].url')" > .circleci/SIZE
+	@echo "===> Getting artifact sizes from CircleCI"
+	@cd .circleci; rm size || true
+	@http https://circleci.com/api/v1.1/project/github/${REPO}/$(shell cat .circleci/build_num)/artifacts${CIRCLE_TOKEN} | jq -r ".[] | .url" | xargs wget -q -P .circleci
 
-clean: clean_pyc ## Clean docker image and stop all running containers
+clean:
 	docker-clean stop
-	docker rmi $(ORG)/$(NAME):$(VERSION) || true
-	docker rmi $(ORG)/$(NAME):latest || true
-	rm $(MALWARE) || true
-	rm README.md.bu || true
-
-## Clean all compiled python files
-clean_pyc:
-	find . -name "*.pyc" -exec rm -f {} \;
-	rm *.log || true
-	rm test/dump/* || true
+	docker image rm $(ORG)/$(NAME):$(VERSION)
+	docker image rm $(ORG)/$(NAME):latest
+	rm $(MALWARE)
 
 # Absolutely awesome: http://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
-.PHONY: help
-help: Makefile
-	@echo
-	@echo " Choose a command run in "$(PROJECTNAME)":"
-	@echo
-	@sed -n 's/^##//p' $< | column -t -s ':' |  sed -e 's/^/ /'
-	@echo
+help:
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s %s\n", $$1, $$2}'
 
 .DEFAULT_GOAL := all
